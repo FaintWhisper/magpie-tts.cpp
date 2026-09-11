@@ -1,6 +1,8 @@
 #ifndef MAGPIE_TTS_CAPI_H
 #define MAGPIE_TTS_CAPI_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,6 +22,7 @@ typedef struct magpie_tts_ctx magpie_tts_ctx;
 //
 // v1: initial surface (abi_version, load, free, last_error, free_string,
 //     free_audio, synthesize).
+// v2: deterministic synthesis options.
 int magpie_tts_capi_abi_version(void);
 
 // Load a GGUF model (arch "magpie-tts"). Returns an owning context, or NULL
@@ -41,6 +44,14 @@ void magpie_tts_capi_free(magpie_tts_ctx* ctx);
 float* magpie_tts_capi_synthesize(magpie_tts_ctx* ctx, const char* text,
                                   const char* language, const char* speaker,
                                   int* out_n_samples);
+
+// Extended deterministic synthesis entry point. Negative values select the
+// model defaults for temperature, top-k, CFG scale and max frames. A seed of
+// zero retains the original nondeterministic behavior.
+float* magpie_tts_capi_synthesize_ex(
+    magpie_tts_ctx* ctx, const char* text, const char* language,
+    const char* speaker, uint64_t seed, float temperature, int topk,
+    float cfg_scale, int n_threads, int max_frames, int* out_n_samples);
 
 // Free a string previously returned by this API. Safe on NULL.
 void magpie_tts_capi_free_string(char* s);

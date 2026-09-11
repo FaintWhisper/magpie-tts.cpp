@@ -15,10 +15,32 @@ struct magpie_tts_ctx {
     ~magpie_tts_ctx() { magpie_tts_free(inner); }
 };
 
+static float* synthesize_with_options(magpie_tts_ctx* ctx, const char* text,
+                                      const magpie_tts_options& opts,
+                                      int* out_n_samples) {
+    if (out_n_samples) *out_n_samples = 0;
+    if (!ctx) return nullptr;
+    if (!ctx->inner) { ctx->last_error = "context has no model"; return nullptr; }
+    if (!text)       { ctx->last_error = "text is NULL"; return nullptr; }
+    try {
+        std::vector<float> pcm = magpie_tts_synthesize(*ctx->inner, text, opts);
+        float* out = (float*)std::malloc(pcm.size() * sizeof(float));
+        if (!out) { ctx->last_error = "out of memory"; return nullptr; }
+        std::copy(pcm.begin(), pcm.end(), out);
+        if (out_n_samples) *out_n_samples = (int)pcm.size();
+        return out;
+    } catch (const std::exception& e) {
+        ctx->last_error = e.what();
+    } catch (...) {
+        ctx->last_error = "unknown exception";
+    }
+    return nullptr;
+}
+
 extern "C" {
 
 int magpie_tts_capi_abi_version(void) {
-    return 1;
+    return 2;
 }
 
 magpie_tts_ctx* magpie_tts_capi_load(const char* gguf_path) {
@@ -47,26 +69,26 @@ void magpie_tts_capi_free(magpie_tts_ctx* ctx) {
 float* magpie_tts_capi_synthesize(magpie_tts_ctx* ctx, const char* text,
                                   const char* language, const char* speaker,
                                   int* out_n_samples) {
-    if (out_n_samples) *out_n_samples = 0;
-    if (!ctx) return nullptr;
-    if (!ctx->inner) { ctx->last_error = "context has no model"; return nullptr; }
-    if (!text)       { ctx->last_error = "text is NULL"; return nullptr; }
-    try {
-        magpie_tts_options opts;
-        if (language && *language) opts.language = language;
-        if (speaker  && *speaker)  opts.speaker  = speaker;
-        std::vector<float> pcm = magpie_tts_synthesize(*ctx->inner, text, opts);
-        float* out = (float*)std::malloc(pcm.size() * sizeof(float));
-        if (!out) { ctx->last_error = "out of memory"; return nullptr; }
-        std::copy(pcm.begin(), pcm.end(), out);
-        if (out_n_samples) *out_n_samples = (int)pcm.size();
-        return out;
-    } catch (const std::exception& e) {
-        ctx->last_error = e.what();
-    } catch (...) {
-        ctx->last_error = "unknown exception";
-    }
-    return nullptr;
+    magpie_tts_options opts;
+    if (language && *language) opts.language = language;
+    if (speaker  && *speaker)  opts.speaker  = speaker;
+    return synthesize_with_options(ctx, text, opts, out_n_samples);
+}
+
+float* magpie_tts_capi_synthesize_ex(
+    magpie_tts_ctx* ctx, const char* text, const char* language,
+    const char* speaker, uint64_t seed, float temperature, int topk,
+    float cfg_scale, int n_threads, int max_frames, int* out_n_samples) {
+    magpie_tts_options opts;
+    if (language && *language) opts.language = language;
+    if (speaker  && *speaker)  opts.speaker  = speaker;
+    opts.seed = seed;
+    opts.temperature = temperature;
+    opts.topk = topk;
+    opts.cfg_scale = cfg_scale;
+    opts.n_threads = n_threads;
+    opts.max_frames = max_frames;
+    return synthesize_with_options(ctx, text, opts, out_n_samples);
 }
 
 void magpie_tts_capi_free_string(char* s) {
