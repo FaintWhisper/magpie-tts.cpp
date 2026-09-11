@@ -26,7 +26,10 @@ static int usage() {
         "        [--output <wav>] [--threads <n>]\n"
         "  bench --model <gguf>                 timed synthesis, median over runs\n"
         "        [--text <text>] [--lang <code>] [--speaker <name|index>]\n"
-        "        [--seed <n>=1234] [--runs <n>=3] [--threads <n>] [--json]\n");
+        "        [--seed <n>=1234] [--runs <n>=3] [--threads <n>] [--json]\n"
+        "  stream --model <gguf> --text <text>  streaming synthesis to a WAV\n"
+        "        [--chunk-frames <n>=4] [--queue-depth <n>=4] [--lang <code>]\n"
+        "        [--speaker <name|index>] [--seed <n>] [--output <wav>]\n");
     return 2;
 }
 
@@ -326,6 +329,95 @@ static int cmd_info(const std::string& model_path) {
     return 0;
 }
 
+// stream: streaming synthesis. PCM arrives in chunks through a callback that
+// appends to a WAV as it goes; the report shows TTFA (first audio) vs the
+// total synthesis time of the offline `say` path.
+static int cmd_stream(const std::string& model_path, const std::string& text,
+                      const std::string& lang, const std::string& speaker,
+                      const std::string& output, uint64_t seed, int threads,
+                      int32_t chunk_frames, int32_t queue_depth) {
+    try {
+        const auto t0 = std::chrono::steady_clock::now();
+        magpie_tts_context* ctx = magpie_tts_load(model_path);
+        const auto t1 = std::chrono::steady_clock::now();
+
+        magpie_tts_options opts;
+        opts.language  = lang;
+        opts.seed      = seed;
+        opts.n_threads = threads;
+        if (!speaker.empty()) {
+            char* end = nullptr;
+            const long idx = std::strtol(speaker.c_str(), &end, 10);
+            if (end && *end == '\0') opts.speaker_index = (int32_t)idx;
+            else                     opts.speaker = speaker;
+        }
+
+        const int32_t sr = magpie_tts_sample_rate(*ctx);
+        FILE* wav = std::fopen(output.c_str(), "wb");
+        if (!wav) {
+            std::fprintf(stderr, "cannot open %s\n", output.c_str());
+            return 1;
+        }
+        // placeholder 44-byte canonical header, patched after the stream ends
+        const uint8_t hdr[44] = {
+            'R','I','F','F', 0,0,0,0, 'W','A','V','E','f','m','t',' ',
+            16,0,0,0, 1,0, 1,0, 0,0,0,0, 0,0,0,0, 1,0,16,0,
+            'd','a','t','a', 0,0,0,0};
+        std::fwrite(hdr, 1, sizeof(hdr), wav);
+        uint32_t data_bytes = 0;
+        std::vector<uint8_t> first_chunk;
+        std::chrono::steady_clock::time_point t_first;
+
+        magpie_tts_stream_result res = magpie_tts_synthesize_stream(
+            *ctx, text, opts, chunk_frames, queue_depth, /*n_threads_codec*/0,
+            [&](const std::vector<uint8_t>& pcm) -> bool {
+                if (first_chunk.empty()) {
+                    t_first = std::chrono::steady_clock::now();
+                    first_chunk = pcm;
+                }
+                data_bytes += (uint32_t)pcm.size();
+                return std::fwrite(pcm.data(), 1, pcm.size(), wav) == pcm.size();
+            });
+        std::fclose(wav);
+
+        // patch the WAV header
+        wav = std::fopen(output.c_str(), "r+b");
+        if (wav) {
+            const uint32_t riff = 36 + data_bytes;
+            std::fseek(wav, 4, SEEK_SET);
+            std::fwrite(&riff, 4, 1, wav);
+            const uint32_t dr = data_bytes;
+            std::fseek(wav, 40, SEEK_SET);
+            std::fwrite(&dr, 4, 1, wav);
+            std::fseek(wav, 24, SEEK_SET);
+            std::fwrite(&sr, 4, 1, wav);
+            const uint32_t byte_rate = (uint32_t)sr * 2;
+            std::fseek(wav, 28, SEEK_SET);
+            std::fwrite(&byte_rate, 4, 1, wav);
+            std::fclose(wav);
+        }
+
+        const auto t_end = std::chrono::steady_clock::now();
+        const double ttfa = std::chrono::duration<double, std::milli>(
+            t_first - t1).count();
+        const double total = std::chrono::duration<double, std::milli>(
+            t_end - t1).count();
+        const double load = std::chrono::duration<double, std::milli>(
+            t1 - t0).count();
+        std::printf("streamed %s: %u samples @ %d Hz (%.2f s audio) in %zu chunks\n",
+                    output.c_str(), (unsigned)(data_bytes / 2), sr,
+                    (double)(data_bytes / 2) / sr, (size_t)res.stats.chunks);
+        std::printf("timing: load %.2f s, ttfa %.1f ms (chunk_frames=%d, first chunk %zu bytes), total %.2f s%s\n",
+                    load / 1000.0, res.cancelled ? -1.0 : ttfa,
+                    res.stats.chunk_frames, first_chunk.size() / 2,
+                    total / 1000.0, res.cancelled ? " [CANCELLED]" : "");
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "error: %s\n", e.what());
+        return 1;
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     const std::string cmd = argv[1];
@@ -374,6 +466,18 @@ int main(int argc, char** argv) {
             text = "Hello world, this is a test of the text to speech system.";
         if (!seed_given) seed = 1234;  // deterministic runs by default
         return cmd_bench(model, text, lang, speaker, seed, runs, threads, json);
+    }
+    if (cmd == "stream") {
+        if (model.empty() || text.empty()) return usage();
+        int32_t chunk_frames = 4, queue_depth = 4;
+        for (int i = 2; i < argc; ++i) {
+            if (!std::strcmp(argv[i], "--chunk-frames"))
+                chunk_frames = std::atoi(argv[++i]);
+            else if (!std::strcmp(argv[i], "--queue-depth"))
+                queue_depth = std::atoi(argv[++i]);
+        }
+        return cmd_stream(model, text, lang, speaker, output, seed, threads,
+                          chunk_frames, queue_depth);
     }
     return usage();
 }

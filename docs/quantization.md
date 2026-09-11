@@ -128,3 +128,20 @@ add a 170 MB F16 floor. Quantizing further would require routing
 `embed_stack`/the LT embedding gather through `ggml_get_rows` and giving
 `conv_causal` an explicit kernel-size parameter so the encoder convs can be
 stored 2-D; both are deliberate non-goals for this phase.
+
+## Streaming compatibility
+
+Streaming (`src/codec_stream.cpp`, `magpie_tts_synthesize_stream`) changes
+WHEN the audio tokens are decoded and played, not their format. Q8 quantization
+applies selectively to the Magpie generator (matmul A weights); it still
+produces ordinary integer audio-code tokens, and the NanoCodec convolution
+weights remain F32. The chunked codec decodes the same tokens with carried
+conv-left-context and transposed-conv-spill state, so:
+
+* CPU: streaming output is **bit-identical** to offline `codec_decode` for
+  chunk sizes 4/16/32/64 and within 2e-6 at 7 (see `tests/test_codec_stream.cpp`).
+* CUDA: <= 1.6e-3 amplitude difference (-56 dB) because ggml's CUDA kernels
+  pick different reduction orders for different graph shapes; CPU stays exact.
+* TTFA: first PCM chunk reaches the callback after the first ~4 frames are
+  generated + decoded (~0.4 s in practice incl. the first AR steps), while the
+  sentence keeps generating (`magpie-cli stream` reports it).

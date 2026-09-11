@@ -784,7 +784,7 @@ magpie_tts_stream_result magpie_tts_synthesize_stream(
                 }
             }
             result.stats.chunks = chunks_done;
-            result.stats.chunk_frames = stats_chunk_frames;
+            result.stats.chunk_frames = chunk_frames;
         } catch (...) {
             worker_exc = std::current_exception();
             queue.set_failed();

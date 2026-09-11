@@ -209,8 +209,9 @@ ggml_tensor* cache_input(ggml_context* ctx,
     cache_at(caches, idx, len, channels);
     ggml_tensor* t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, len, channels, 1);
     ggml_set_input(t);
-    MG_LOG("codec_stream: cache IN  site=%zu kind=%s len=%d ch=%d", idx,
-           kind == CACHE_CONV ? "conv" : "tconv", (int)len, (int)channels);
+    if (std::getenv("MAGPIE_STREAM_DEBUG"))
+        MG_LOG("codec_stream: cache IN  site=%zu kind=%s len=%d ch=%d", idx,
+               kind == CACHE_CONV ? "conv" : "tconv", (int)len, (int)channels);
     inputs.push_back({t, kind, idx});
     return t;
 }
@@ -219,8 +220,9 @@ void cache_output(ggml_tensor* t,
                   std::vector<magpie_codec_stream_graph::impl::pending>& outputs,
                   int kind, size_t idx) {
     ggml_set_output(t);
-    MG_LOG("codec_stream: cache OUT site=%zu kind=%s", idx,
-           kind == CACHE_CONV ? "conv" : "tconv");
+    if (std::getenv("MAGPIE_STREAM_DEBUG"))
+        MG_LOG("codec_stream: cache OUT site=%zu kind=%s", idx,
+               kind == CACHE_CONV ? "conv" : "tconv");
     outputs.push_back({t, kind, idx});
 }
 
@@ -485,7 +487,6 @@ void codec_stream_init(const magpie_model& model, mg::backend& be,
     };
 
     // pre_conv: [T, 32] -> [T, 864]
-    MG_LOG("codec_stream: building graph for chunk_frames=%d", (int)chunk_frames);
     ggml_tensor* x = conv(x0, P + "pre_conv", 1);
 
     for (int i = 0; i < n_stages; ++i) {
