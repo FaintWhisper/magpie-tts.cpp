@@ -58,6 +58,7 @@ set(MAGPIE_SOURCES
     src/local_transformer.cpp
     src/prior.cpp
     src/codec.cpp
+    src/codec_stream.cpp
     src/audio_io.cpp
     src/magpie_tts.cpp
     src/magpie_tts_capi.cpp

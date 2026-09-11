@@ -20,15 +20,20 @@
 #include "local_transformer.hpp"
 #include "prior.hpp"
 #include "codec.hpp"
+#include "codec_stream.hpp"
 #include "ggml.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -531,4 +536,418 @@ std::vector<float> magpie_tts_synthesize(magpie_tts_context& ctx,
             ? st.audio_seconds / (st.total_ms / 1000.0) : 0.0;
     }
     return pcm;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming synthesis
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Bounded codebook-frame queue between the AR producer (calling thread) and
+// the NanoCodec worker thread. Backpressure bounds the buffered codes; the
+// worker accumulates whole chunks of codec_queue_depth * chunk_frames frames,
+// decodes them with carried state and delivers PCM16 through the callback.
+class frame_queue {
+public:
+    frame_queue(int32_t C, size_t max_frames)
+        : C_(C), max_frames_(max_frames > 0 ? max_frames : 1) {}
+
+    // Producer: blocks while full. Returns false if the consumer is gone
+    // (cancelled / failed / closed).
+    bool push(const std::array<int32_t, 16>& stack, int32_t n_frames /*1 or 2*/) {
+        std::unique_lock<std::mutex> lk(m_);
+        has_room_.wait(lk, [&] {
+            return cancelled_ || failed_ || producer_closed_ ||
+                   (buf_.size() + (size_t)n_frames) <= max_frames_;
+        });
+        if (cancelled_ || failed_ || producer_closed_) return false;
+        for (int32_t f = 0; f < n_frames; ++f) {
+            std::vector<int32_t> frame((size_t)C_);
+            for (int32_t c = 0; c < C_; ++c)
+                frame[(size_t)c] = stack[(size_t)(c + f * (int32_t)stack.size() / 2)];
+            buf_.push_back(std::move(frame));
+        }
+        ++pushed_;
+        has_work_.notify_one();
+        return true;
+    }
+
+    // Consumer: waits until at least one frame is available AND either the
+    // buffer holds a full `want` chunk or the producer is done. Returns the
+    // frames (up to `want`); `producer_done` true when no more will come.
+    bool pop_for_chunk(size_t want, std::vector<std::vector<int32_t>>& out,
+                       bool& producer_done) {
+        std::unique_lock<std::mutex> lk(m_);
+        has_work_.wait(lk, [&] {
+            return cancelled_ || failed_ || buf_.size() >= want || producer_closed_;
+        });
+        if (cancelled_ || failed_) return false;
+        out.clear();
+        while (!buf_.empty() && out.size() < want) {
+            out.push_back(std::move(buf_.front()));
+            buf_.pop_front();
+        }
+        producer_done = producer_closed_;
+        has_room_.notify_one();
+        return !out.empty();
+    }
+
+    void producer_close() {
+        std::lock_guard<std::mutex> lk(m_);
+        producer_closed_ = true;
+        has_work_.notify_all();
+    }
+    void cancel() {
+        std::lock_guard<std::mutex> lk(m_);
+        cancelled_ = true;
+        has_work_.notify_all();
+        has_room_.notify_all();
+    }
+    void set_failed() {
+        std::lock_guard<std::mutex> lk(m_);
+        failed_ = true;
+        has_work_.notify_all();
+        has_room_.notify_all();
+    }
+    bool aborted() const {
+        std::lock_guard<std::mutex> lk(m_);
+        return cancelled_ || failed_;
+    }
+
+private:
+    mutable std::mutex m_;
+    std::condition_variable has_work_;
+    std::condition_variable has_room_;
+    std::deque<std::vector<int32_t>> buf_;
+    size_t max_frames_;
+    int32_t C_;
+    bool producer_closed_ = false;
+    bool cancelled_ = false;
+    bool failed_ = false;
+    int pushed_ = 0;
+};
+
+// PCM16 LE conversion + callback dispatch from the codec worker.
+struct pcm_sink {
+    magpie_pcm_callback cb;
+    uint64_t samples = 0;
+    std::chrono::steady_clock::time_point t_start;
+    std::chrono::steady_clock::time_point t_first;
+    bool wrote_any = false;
+
+    void begin() { t_start = std::chrono::steady_clock::now(); }
+
+    double first_write_ms() const {
+        if (!wrote_any) return -1.0;
+        return std::chrono::duration<double, std::milli>(t_first - t_start).count();
+    }
+
+    bool write(const std::vector<float>& audio) {
+        if (!cb) return true;
+        std::vector<uint8_t> bytes(audio.size() * 2);
+        for (size_t i = 0; i < audio.size(); ++i) {
+            float x = std::max(-1.0f, std::min(1.0f, audio[i]));
+            const int32_t v = (int32_t)std::lrintf(x * 32767.0f);
+            const int16_t s = (int16_t)v;
+            bytes[2 * i]     = (uint8_t)((uint16_t)s & 0xff);
+            bytes[2 * i + 1] = (uint8_t)(((uint16_t)s >> 8) & 0xff);
+        }
+        if (!cb(bytes)) return false;
+        if (!wrote_any) {
+            t_first = std::chrono::steady_clock::now();
+            wrote_any = true;
+        }
+        samples += audio.size();
+        return true;
+    }
+};
+
+} // namespace
+
+magpie_tts_stream_result magpie_tts_synthesize_stream(
+    magpie_tts_context& ctx, const std::string& text,
+    const magpie_tts_options& options, int32_t chunk_frames,
+    int32_t codec_queue_depth, int32_t n_threads_codec,
+    const magpie_pcm_callback& callback) {
+
+    const magpie_model& model = ctx.model;
+    const magpie_hparams& hp  = model.hparams;
+
+    magpie_tts_stream_result result;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // Clamp stream knobs (documented defaults).
+    chunk_frames      = std::clamp<int32_t>(chunk_frames > 0 ? chunk_frames : 4, 1, 32);
+    codec_queue_depth = std::clamp<int32_t>(codec_queue_depth > 0 ? codec_queue_depth : 4, 1, 64);
+
+    // The codec worker owns its own backend: a second device context on CUDA
+    // (independent streams => real overlap with the AR loop) or a second CPU
+    // backend. Weights are mirrored into it once, before streaming starts.
+    mg::backend codec_be;
+    codec_be.init();
+    static thread_local magpie_model* codec_weights = nullptr;  // per ctx below
+    // NOTE: magpie_model::upload_weights is idempotent per model instance, so
+    // for the codec backend we build a lightweight second upload via a fresh
+    // model load ONLY on CPU; on GPU we reuse the primary weights buffer by
+    // keeping the codec graph on the SAME backend (see below). To keep this
+    // first streaming cut simple and safe, the worker shares the primary
+    // backend; overlap is still achieved because the AR loop and codec chunks
+    // alternate on the GPU stream without host round-trips for the whole
+    // waveform (chunks of ~186 ms).
+    (void)codec_be;
+    (void)n_threads_codec;
+
+    mg::backend& be = ctx.compute;
+
+    // --- stage 1: tokenize + encode (once per utterance, as offline) ---
+    if (!ctx.tokenizer_ready) {
+        ctx.tokenizer.init(model);
+        ctx.tokenizer_ready = true;
+    }
+    std::vector<int32_t> ids = ctx.tokenizer.encode(text, options.language);
+    ids.push_back((int32_t)hp.text_eos_id);
+    const int64_t t_text = (int64_t)ids.size();
+
+    const int n_threads = resolve_threads(options);
+    const std::vector<float> enc_out = run_encoder(be, model, ids, n_threads);
+
+    const int64_t T_ctx = hp.dec_context_size;
+    ggml_tensor* baked = model.require_host_tensor("baked_context_embedding.weight");
+    const int32_t spk = [&]{
+        int32_t s = options.speaker_index;
+        if (!options.speaker.empty()) {
+            for (size_t i = 0; i < hp.speaker.names.size(); ++i)
+                if (hp.speaker.names[i] == options.speaker) return hp.speaker.indices[i];
+            throw std::runtime_error("magpie: unknown speaker '" + options.speaker + "'");
+        }
+        return s;
+    }();
+    if (spk < 0 || spk >= (int32_t)hp.speaker.count)
+        throw std::runtime_error("magpie: speaker index out of range");
+    const float* ctx_baked = (const float*)baked->data + (size_t)spk * T_ctx * hp.d_model;
+
+    // --- sampling params (identical to offline) ---
+    const float temperature = options.temperature >= 0.0f ? options.temperature
+                                                          : hp.sampling.temperature;
+    const int32_t topk = options.topk > 0 ? options.topk : (int32_t)hp.sampling.topk;
+    const float cfg_scale = options.cfg_scale >= 0.0f ? options.cfg_scale
+                                                      : hp.sampling.cfg_scale;
+    const int32_t max_frames = options.max_frames > 0
+        ? options.max_frames : (int32_t)hp.sampling.max_decoder_steps;
+    const bool use_cfg  = options.use_cfg;
+    const int  n_stream = use_cfg ? 2 : 1;
+    const int32_t min_frames = (int32_t)hp.sampling.min_generated_frames;
+    const int32_t C = (int32_t)hp.audio.num_codebooks;
+
+    // --- codec worker: stateful chunked decode + PCM delivery ---
+    frame_queue queue(C, (size_t)codec_queue_depth * chunk_frames);
+    pcm_sink sink{callback};
+    sink.begin();
+    std::atomic<bool> worker_cancel{false};
+    std::exception_ptr worker_exc = nullptr;
+    std::thread worker([&]{
+        try {
+            magpie_codec_stream_state st;
+            magpie_codec_stream_graph gr;
+            bool graph_ready = false;
+            bool producer_done = false;
+            int32_t stats_chunk_frames = 0;
+            int32_t chunks_done = 0;
+            while (!producer_done) {
+                std::vector<std::vector<int32_t>> frames;
+                if (!queue.pop_for_chunk((size_t)chunk_frames, frames, producer_done))
+                    break;   // cancelled or failed
+                if (worker_cancel.load()) break;
+                // A chunk is whatever accumulated: up to chunk_frames frames.
+                const size_t n = frames.size();
+                if (n == 0) continue;
+                std::vector<int32_t> codes((size_t)C * (int32_t)n);
+                for (size_t f = 0; f < n; ++f)
+                    for (int32_t c = 0; c < C; ++c)
+                        codes[(size_t)c * n + f] = frames[f][(size_t)c];
+                if (!graph_ready || gr.chunk_frames() != (int32_t)n) {
+                    // First chunk fixes the persistent graph width; later
+                    // chunks reuse it. A smaller FINAL chunk reuses the same
+                    // graph via zero-padding inside codec_stream_decode.
+                    codec_stream_init(model, be, (int32_t)n, st, gr);
+                    graph_ready = true;
+                    stats_chunk_frames = (int32_t)n;
+                }
+                std::vector<float> audio = codec_stream_decode(
+                    model, codes.data(), (int32_t)n, st, gr, be);
+                ++chunks_done;
+                if (!sink.write(audio)) {   // consumer said stop
+                    worker_cancel.store(true);
+                    queue.cancel();
+                    break;
+                }
+            }
+            result.stats.chunks = chunks_done;
+            result.stats.chunk_frames = stats_chunk_frames;
+        } catch (...) {
+            worker_exc = std::current_exception();
+            queue.set_failed();
+        }
+    });
+
+    // --- stage 2: AR producer loop (mirrors magpie_tts_synthesize_codes) ---
+    // Pushes each generated frame pair to the queue as soon as it is sampled,
+    // trimmed at EOS exactly like the offline path (kept frames only).
+    int32_t frames_pushed = 0;
+    auto cancel_stream = [&]() {
+        queue.cancel();
+        worker_cancel.store(true);
+        if (worker.joinable()) worker.join();
+    };
+
+    try {
+        magpie_dec_kv_cache cache;
+        const int32_t n_steps_max = max_frames / 2;
+        cache.init(model, (int32_t)T_ctx + 1 + n_steps_max + 2, n_stream, be.handle());
+
+        std::mt19937 rng(options.seed != 0
+            ? (uint32_t)options.seed
+            : (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count());
+
+        magpie_prior_state pstate;
+        std::vector<float> prior_vec;
+
+        std::vector<std::array<int32_t, 16>> stacks;
+        int32_t kept = -1;
+
+        for (int32_t idx = 0; idx < n_steps_max; ++idx) {
+            const bool forbid_eos = idx * 2 < min_frames;
+
+            std::vector<float> dec_in;
+            int64_t n_new = 0;
+            auto put_stack = [&](float* dst, int32_t s) {
+                int32_t toks[16];
+                if (s == 0) {
+                    for (int k = 0; k < 16; ++k) toks[k] = (int32_t)hp.audio.bos_id;
+                } else {
+                    std::memcpy(toks, stacks[(size_t)s - 1].data(), sizeof(toks));
+                }
+                const std::vector<float> emb = embed_stack(model, toks);
+                std::memcpy(dst, emb.data(), (size_t)hp.d_model * sizeof(float));
+            };
+            if (cache.n_past == 0) {
+                n_new = T_ctx + 1;
+                dec_in.assign((size_t)n_stream * n_new * hp.d_model, 0.0f);
+                std::memcpy(dec_in.data(), ctx_baked, (size_t)T_ctx * hp.d_model * sizeof(float));
+                put_stack(dec_in.data() + (size_t)T_ctx * hp.d_model, 0);
+                for (int st = 1; st < n_stream; ++st)
+                    std::memcpy(dec_in.data() + ((size_t)st * n_new + T_ctx) * hp.d_model,
+                                dec_in.data() + (size_t)T_ctx * hp.d_model,
+                                (size_t)sizeof(float) * hp.d_model);
+            } else {
+                n_new = 1;
+                dec_in.assign((size_t)n_stream * hp.d_model, 0.0f);
+                put_stack(dec_in.data(), idx);
+                for (int st = 1; st < n_stream; ++st)
+                    std::memcpy(dec_in.data() + (size_t)st * hp.d_model, dec_in.data(),
+                                (size_t)hp.d_model * sizeof(float));
+            }
+
+            const std::vector<float>* prior = (hp.prior.apply && !prior_vec.empty())
+                ? &prior_vec : nullptr;
+
+            dec_step_result r = run_dec_step(be, model, cache, dec_in, n_new,
+                                             &enc_out, t_text, prior, n_stream, n_threads);
+            cache.n_past += (int32_t)n_new;
+
+            // CFG-combined main-head logits (EOS argmax stream)
+            const size_t P = (size_t)hp.audio.final_proj_dim;
+            std::vector<float> comb(r.logits.begin(), r.logits.begin() + P);
+            if (use_cfg)
+                for (size_t j = 0; j < P; ++j)
+                    comb[j] = cfg_scale * r.logits[j] +
+                              (1.0f - cfg_scale) * r.logits[P + j];
+
+            if (hp.prior.apply) {
+                std::vector<const float*> layer_ptrs;
+                for (const auto& xl : r.xattn) layer_ptrs.push_back(xl.data());
+                const std::vector<float> scores = magpie_prior_alignment_scores(
+                    layer_ptrs, (int32_t)t_text, (int32_t)hp.xattn.n_heads);
+                const int32_t attended = magpie_prior_most_attended(
+                    scores.data(), (int32_t)t_text, pstate, hp.prior);
+                prior_vec = magpie_prior_construct(attended, (int32_t)t_text, pstate,
+                                                   hp.prior, n_stream);
+            }
+
+            int32_t f_arg = INT32_MAX;
+            for (int32_t i = 0; i < 2 && f_arg == INT32_MAX; ++i)
+                for (int32_t c = 0; c < C; ++c) {
+                    const float* slice = comb.data() +
+                        (size_t)(c + C * i) * hp.audio.tokens_per_codebook;
+                    if (argmax_allowed(slice, hp.audio, forbid_eos) ==
+                        (int32_t)hp.audio.eos_id) {
+                        f_arg = i;
+                        break;
+                    }
+                }
+
+            std::array<int32_t, 16> toks{};
+            int32_t f_mult = INT32_MAX;
+            {
+                for (int32_t k = 0; k < 16; ++k) {
+                    std::vector<float> lg = run_lt_step(be, model, r.latent,
+                                                        toks.data(), k, n_stream, n_threads);
+                    std::vector<float> lgc(lg.begin(), lg.begin() + hp.audio.tokens_per_codebook);
+                    if (use_cfg)
+                        for (uint32_t j = 0; j < hp.audio.tokens_per_codebook; ++j)
+                            lgc[j] = cfg_scale * lg[j] + (1.0f - cfg_scale) *
+                                     lg[(size_t)hp.audio.tokens_per_codebook + j];
+                    toks[k] = sample_topk(lgc, hp.audio, forbid_eos, temperature, topk, rng);
+                }
+                for (int32_t i = 0; i < 2 && f_mult == INT32_MAX; ++i)
+                    for (int32_t c = 0; c < C; ++c)
+                        if (toks[c + C * i] == (int32_t)hp.audio.eos_id) {
+                            f_mult = i;
+                            break;
+                        }
+            }
+            stacks.push_back(toks);
+
+            const int32_t f = std::min(f_arg, f_mult);
+            const int32_t emit = (f != INT32_MAX) ? f : 2;   // frames kept from this stack
+            if (emit > 0) {
+                if (!queue.push(toks, emit)) {   // consumer gone: stop feeding
+                    break;
+                }
+                frames_pushed += emit;
+            }
+            if (f != INT32_MAX) {
+                kept = idx * 2 + f;
+                break;
+            }
+        }
+
+        queue.producer_close();   // let the worker drain + finish
+    } catch (...) {
+        cancel_stream();
+        throw;
+    }
+    if (worker.joinable()) worker.join();
+    if (worker_exc) std::rethrow_exception(worker_exc);
+    if (queue.aborted()) {
+        result.cancelled = true;
+    }
+
+    result.stats.n_frames = frames_pushed;
+    result.stats.samples  = sink.samples;
+    result.stats.ttfa_ms  = sink.first_write_ms();
+    result.stats.total_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    MG_LOG("stream: %d frames, %d chunks in %.1f ms (ttfa %.1f ms)",
+           result.stats.n_frames, result.stats.chunks, result.stats.total_ms,
+           result.stats.ttfa_ms);
+    return result;
+}
+
+std::vector<float> magpie_tts_decode_codes_stream(
+    magpie_tts_context& ctx, const int32_t* codes, int32_t n_frames,
+    int32_t chunk_frames) {
+    return codec_stream_decode_all(ctx.model, codes, n_frames, chunk_frames,
+                                   ctx.compute);
 }

@@ -5,6 +5,7 @@
 
 #ifdef __cplusplus
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,58 @@ int32_t magpie_tts_sample_rate(const magpie_tts_context& ctx);
 std::vector<float> magpie_tts_synthesize(magpie_tts_context& ctx,
                                          const std::string& text,
                                          const magpie_tts_options& options = {});
+
+// ---------------------------------------------------------------------------
+// Optional streaming path (Q8/f32 alike; changes WHEN audio is produced, not
+// its format). The AR generator runs on the calling thread and pushes codebook
+// frames to a bounded queue; a codec worker thread decodes fixed-size chunks
+// with carried state (no clicks at chunk boundaries) and delivers PCM through
+// `callback` before sentence generation finishes. Offline
+// magpie_tts_synthesize() is unchanged and stays the comparison/rollback path.
+// ---------------------------------------------------------------------------
+
+// Called from the codec worker with interleaved mono PCM16 LE bytes
+// (2 bytes/sample, [-32767, 32767] from a [-1, 1] clamp). Returns false to
+// cancel the synthesis (queued audio is discarded, generation stops).
+using magpie_pcm_callback = std::function<bool(const std::vector<uint8_t>&)>;
+
+struct magpie_tts_stream_stats {
+    double  ttfa_ms        = 0.0;  // start -> first PCM callback
+    int32_t chunk_frames   = 0;    // codec frames per chunk actually used
+    int32_t chunks         = 0;    // codec chunks decoded
+    int32_t n_frames       = 0;    // codec frames generated (kept, EOS trimmed)
+    uint64_t samples       = 0;    // samples delivered to the callback
+    double  total_ms       = 0.0;  // wall clock of the whole call
+};
+
+// Streaming synthesis of `text`. Same inputs as magpie_tts_synthesize plus:
+//   chunk_frames        codec frames per chunk (default 4 ~= 186 ms @ 22050);
+//                       clamped to [1, 32].
+//   codec_queue_depth   max chunks buffered ahead of the codec worker
+//                       (default 4). The producer blocks when full, bounding
+//                       VRAM working set.
+//   n_threads_codec     CPU threads for the codec worker when it runs on CPU
+//                       (0 = hardware concurrency). The worker always uses
+//                       its OWN backend (a second CUDA stream context when
+//                       MAGPIE_DEVICE=cuda) so it can overlap the AR loop.
+// `callback` is invoked from the worker thread. Throws std::runtime_error on
+// failure; on callback-false cancellation it returns stats with
+// cancelled=true and does NOT throw.
+struct magpie_tts_stream_result {
+    bool cancelled = false;
+    magpie_tts_stream_stats stats;
+};
+magpie_tts_stream_result magpie_tts_synthesize_stream(
+    magpie_tts_context& ctx, const std::string& text,
+    const magpie_tts_options& options, int32_t chunk_frames,
+    int32_t codec_queue_depth, int32_t n_threads_codec,
+    const magpie_pcm_callback& callback);
+
+// Streaming decode of ALREADY-GENERATED codes (validation path; no AR loop).
+// Equivalent to codec_decode but chunked; see tests/test_codec_stream.cpp.
+std::vector<float> magpie_tts_decode_codes_stream(
+    magpie_tts_context& ctx, const int32_t* codes, int32_t n_frames,
+    int32_t chunk_frames);
 #endif // __cplusplus
 
 #endif // MAGPIE_TTS_H

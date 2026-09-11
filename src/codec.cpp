@@ -31,6 +31,7 @@
 #include "ggml.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -243,6 +244,14 @@ std::vector<float> codec_decode(const magpie_model& model,
     // pre_conv: [T, 32] -> [T, 864]
     ggml_tensor* x = conv(x0, P + "pre_conv", 1);
 
+    // Optional debug dump of the pre_conv output (offline oracle for streaming
+    // cache validation): MAGPIE_CODEC_DUMP=<path> writes [T, 864] f32 raw.
+    ggml_tensor* pc_dump = nullptr;
+    if (std::getenv("MAGPIE_CODEC_DUMP")) {
+        pc_dump = x;
+        s.mark_output(pc_dump);
+    }
+
     for (int i = 0; i < n_stages; ++i) {
         // activation BEFORE the upsampler, res layer AFTER it
         x = snake(x, P + "activations." + std::to_string(i) +
@@ -286,5 +295,19 @@ std::vector<float> codec_decode(const magpie_model& model,
     }
     std::vector<float> wav(n_samples);
     s.read(x, wav.data());
+
+    if (pc_dump) {
+        std::vector<float> pc((size_t)T * 864);
+        if ((size_t)ggml_nelements(pc_dump) == pc.size()) {
+            s.read(pc_dump, pc.data());
+            FILE* f = std::fopen(std::getenv("MAGPIE_CODEC_DUMP"), "wb");
+            if (f) {
+                std::fwrite(pc.data(), sizeof(float), pc.size(), f);
+                std::fclose(f);
+                MG_LOG("codec_decode: dumped pre_conv output [%d, 864] to %s",
+                       (int)T, std::getenv("MAGPIE_CODEC_DUMP"));
+            }
+        }
+    }
     return wav;
 }
