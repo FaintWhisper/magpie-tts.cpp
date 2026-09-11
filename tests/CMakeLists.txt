@@ -5,6 +5,12 @@ function(mg_add_test name)
   # Run from the repo root so model/baseline paths in env vars may be relative.
   add_test(NAME ${name} COMMAND ${name} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77)
+  # the shared magpie-tts.dll must sit next to the test exes on Windows
+  if(WIN32 AND MAGPIE_SHARED)
+    add_custom_command(TARGET ${name} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_BINARY_DIR}/magpie-tts.dll $<TARGET_FILE_DIR:${name}>)
+  endif()
 endfunction()
 
 mg_add_test(test_model_load)
