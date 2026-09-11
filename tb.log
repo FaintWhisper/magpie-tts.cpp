@@ -1,9 +1,0 @@
-**********************************************************************
-** Visual Studio 2022 Developer PowerShell v17.14.40
-** Copyright (c) 2025 Microsoft Corporation
-**********************************************************************
-[1/2] Building CXX object CMakeFiles\magpie-tts.dir\src\codec_stream.cpp.obj
-C:\Workspace\magpie-tts.cpp\src\codec_stream.cpp(621): warning C4996: 'getenv': This function or variable may be unsafe. Consider using _dupenv_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
-C:\Workspace\magpie-tts.cpp\src\codec_stream.cpp(559): warning C4189: 'hp': la variable local se ha inicializado pero no se hace referencia a ella
-[2/2] Linking CXX shared library magpie-tts.dll
-TARGET OK: magpie-tts

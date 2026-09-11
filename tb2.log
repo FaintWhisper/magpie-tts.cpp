@@ -1,7 +1,0 @@
-**********************************************************************
-** Visual Studio 2022 Developer PowerShell v17.14.40
-** Copyright (c) 2025 Microsoft Corporation
-**********************************************************************
-[1/2] Building CXX object tests\CMakeFiles\test_codec_stream.dir\test_codec_stream.cpp.obj
-[2/2] Linking CXX executable tests\test_codec_stream.exe
-TARGET OK: test_codec_stream

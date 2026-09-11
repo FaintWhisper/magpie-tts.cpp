@@ -7,3 +7,7 @@ __pycache__/
 *.npz
 *.wav
 .DS_Store
+build-*/
+*.log
+*.wav
+*.f32
