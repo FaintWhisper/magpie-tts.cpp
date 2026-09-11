@@ -426,6 +426,7 @@ int main(int argc, char** argv) {
     uint64_t seed = 0;
     bool seed_given = false, json = false;
     int threads = 0, runs = 3;
+    int32_t chunk_frames = 4, queue_depth = 4;
     for (int i = 2; i < argc; ++i) {
         auto next = [&](const char* flag) -> const char* {
             if (i + 1 >= argc) {
@@ -445,6 +446,8 @@ int main(int argc, char** argv) {
         }
         else if (!std::strcmp(argv[i], "--threads")) threads = std::atoi(next("--threads"));
         else if (!std::strcmp(argv[i], "--runs"))    runs    = std::atoi(next("--runs"));
+        else if (!std::strcmp(argv[i], "--chunk-frames")) chunk_frames = std::atoi(next("--chunk-frames"));
+        else if (!std::strcmp(argv[i], "--queue-depth"))  queue_depth  = std::atoi(next("--queue-depth"));
         else if (!std::strcmp(argv[i], "--json"))    json    = true;
         else {
             std::fprintf(stderr, "unknown flag: %s\n", argv[i]);
@@ -469,13 +472,6 @@ int main(int argc, char** argv) {
     }
     if (cmd == "stream") {
         if (model.empty() || text.empty()) return usage();
-        int32_t chunk_frames = 4, queue_depth = 4;
-        for (int i = 2; i < argc; ++i) {
-            if (!std::strcmp(argv[i], "--chunk-frames"))
-                chunk_frames = std::atoi(argv[++i]);
-            else if (!std::strcmp(argv[i], "--queue-depth"))
-                queue_depth = std::atoi(argv[++i]);
-        }
         return cmd_stream(model, text, lang, speaker, output, seed, threads,
                           chunk_frames, queue_depth);
     }
