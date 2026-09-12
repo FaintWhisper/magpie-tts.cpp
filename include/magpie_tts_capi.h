@@ -60,6 +60,29 @@ void magpie_tts_capi_free_string(char* s);
 // Safe on NULL.
 void magpie_tts_capi_free_audio(float* samples);
 
+// ---- Streaming synthesis (v3) ---------------------------------------------
+// PCM callback: invoked from the codec worker thread with mono s16-LE bytes.
+// Return 0 to cancel the synthesis. `user` is passed through untouched.
+typedef int (*magpie_tts_stream_pcm_cb)(const unsigned char* pcm_bytes,
+                                        int n_bytes, void* user);
+
+// Streaming synthesis of `text`. Same sampling knobs as synthesize_ex plus:
+//   chunk_frames      codec frames per streamed chunk (<=0 selects 4).
+//   codec_queue_depth buffered-chunks bound (<=0 selects 4).
+//   n_threads_codec   reserved (0 = automatic).
+// On success returns 0 and fills out_* stats. If the PCM callback cancelled
+// the run, returns 1 (stats still valid; check out_cancelled). Other failures
+// return -1 with magpie_tts_capi_last_error set. TTFA is milliseconds from
+// call start to the first PCM callback (-1 if no audio was produced).
+int magpie_tts_capi_synthesize_stream(
+    magpie_tts_ctx* ctx, const char* text, const char* language,
+    const char* speaker, uint64_t seed, float temperature, int topk,
+    float cfg_scale, int n_threads, int max_frames, int chunk_frames,
+    int codec_queue_depth, int n_threads_codec,
+    magpie_tts_stream_pcm_cb pcm_cb, void* user,
+    int* out_cancelled, double* out_ttfa_ms, int* out_chunk_frames,
+    int* out_chunks, int* out_n_frames, long long* out_samples);
+
 // Human-readable description of the last error on `ctx`, or "" if none. The
 // returned pointer is owned by the context and valid until the next call on it
 // (or until magpie_tts_capi_free). Returns "" if `ctx` is NULL.
